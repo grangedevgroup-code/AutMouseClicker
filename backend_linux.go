@@ -2,7 +2,10 @@
 
 package main
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
 func waylandSession() bool {
 	switch os.Getenv("AMC_BACKEND") {
@@ -16,9 +19,9 @@ func waylandSession() bool {
 
 func backendName() string {
 	if waylandSession() {
-		return "Wayland (desktop portal)"
+		return "desktop portal"
 	}
-	return "X11 (XTEST)"
+	return "XTEST"
 }
 
 func newInjector() (Injector, error) {
@@ -29,6 +32,15 @@ func newInjector() (Injector, error) {
 }
 
 func newHotkeys(onStart, onStop func()) (Hotkeys, error) {
+	if os.Getenv("AMC_BACKEND") == "" {
+		h, err := newKDEHotkeys(kdeComponent, onStart, onStop)
+		if err == nil {
+			return h, nil
+		}
+		if !errors.Is(err, errNoKDE) {
+			return nil, err
+		}
+	}
 	if waylandSession() {
 		return newPortalHotkeys(onStart, onStop)
 	}
