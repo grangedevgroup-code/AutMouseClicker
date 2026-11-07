@@ -63,6 +63,7 @@ type Settings struct {
 	Interval time.Duration
 	Button   Button
 	Double   bool
+	Rounds   int
 }
 
 const (
@@ -124,14 +125,21 @@ func (c *Clicker) loop(inject Injector, s Settings, stop, done chan struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(s.Interval)
 	defer ticker.Stop()
-	for {
+	finish := func(err error) {
+		go func() {
+			c.Stop()
+			if c.OnStop != nil {
+				c.OnStop(err)
+			}
+		}()
+	}
+	for round := 1; ; round++ {
 		if err := c.click(inject, s); err != nil {
-			go func() {
-				c.Stop()
-				if c.OnStop != nil {
-					c.OnStop(err)
-				}
-			}()
+			finish(err)
+			return
+		}
+		if s.Rounds > 0 && round >= s.Rounds {
+			finish(nil)
 			return
 		}
 		select {
