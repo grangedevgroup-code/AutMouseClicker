@@ -72,12 +72,11 @@ const (
 	doubleGap   = 40 * time.Millisecond
 )
 
-func Interval(hours, minutes, seconds, tenths, hundredths int) time.Duration {
+func Interval(hours, minutes, seconds, millis int) time.Duration {
 	d := time.Duration(hours)*time.Hour +
 		time.Duration(minutes)*time.Minute +
 		time.Duration(seconds)*time.Second +
-		time.Duration(tenths)*100*time.Millisecond +
-		time.Duration(hundredths)*10*time.Millisecond
+		time.Duration(millis)*time.Millisecond
 	return max(d, MinInterval)
 }
 
@@ -128,6 +127,14 @@ func (c *Clicker) loop(inject Injector, s Settings, stop, done chan struct{}) {
 	finish := func(err error) {
 		go func() {
 			c.Stop()
+			if err != nil {
+				c.mu.Lock()
+				if c.inject == inject {
+					_ = inject.Close()
+					c.inject = nil
+				}
+				c.mu.Unlock()
+			}
 			if c.OnStop != nil {
 				c.OnStop(err)
 			}
