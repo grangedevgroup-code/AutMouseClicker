@@ -50,6 +50,11 @@ func (x *x11Injector) Close() error {
 	return nil
 }
 
+type x11Key struct {
+	code xproto.Keycode
+	mods uint16
+}
+
 type x11Hotkeys struct {
 	conn    *xgb.Conn
 	root    xproto.Window
@@ -57,8 +62,8 @@ type x11Hotkeys struct {
 	onStop  func()
 
 	mu       sync.Mutex
-	start    xproto.Keycode
-	stop     xproto.Keycode
+	start    x11Key
+	stop     x11Key
 	keycodes map[xproto.Keysym]xproto.Keycode
 }
 
@@ -90,60 +95,71 @@ func newX11Hotkeys(onStart, onStop func()) (Hotkeys, error) {
 	return h, nil
 }
 
-func (h *x11Hotkeys) keycode(key string) (xproto.Keycode, error) {
-	n := functionKeyNumber(key)
-	if n == 0 {
-		return 0, fmt.Errorf("unsupported hotkey %q", key)
+func x11Mods(m Modifier) uint16 {
+	switch m {
+	case Ctrl:
+		return xproto.ModMaskControl
+	case Alt:
+		return xproto.ModMask1
+	case Shift:
+		return xproto.ModMaskShift
 	}
-	code, ok := h.keycodes[xproto.Keysym(0xffbe+n-1)]
-	if !ok {
-		return 0, fmt.Errorf("this keyboard has no %s key", key)
-	}
-	return code, nil
+	return 0
 }
 
-func (h *x11Hotkeys) grab(code xproto.Keycode, on bool) error {
+func (h *x11Hotkeys) key(k Hotkey) (x11Key, error) {
+	if !k.Valid() {
+		return x11Key{}, fmt.Errorf("unsupported hotkey %v", k)
+	}
+	code, ok := h.keycodes[xproto.Keysym(0xffbe+k.Key-1)]
+	if !ok {
+		return x11Key{}, fmt.Errorf("this keyboard has no %s key", k.KeyName())
+	}
+	return x11Key{code: code, mods: x11Mods(k.Mod)}, nil
+}
+
+func (h *x11Hotkeys) grab(k x11Key, on bool) error {
 	for _, extra := range lockMasks {
-		mods := xproto.ModMaskControl | extra
+		mods := k.mods | extra
 		if !on {
-			xproto.UngrabKey(h.conn, code, h.root, mods)
+			xproto.UngrabKey(h.conn, k.code, h.root, mods)
 			continue
 		}
-		if err := xproto.GrabKeyChecked(h.conn, true, h.root, mods, code, xproto.GrabModeAsync, xproto.GrabModeAsync).Check(); err != nil {
+		if err := xproto.GrabKeyChecked(h.conn, true, h.root, mods, k.code, xproto.GrabModeAsync, xproto.GrabModeAsync).Check(); err != nil {
 			return fmt.Errorf("another program already uses that key: %w", err)
 		}
 	}
 	return nil
 }
 
-func (h *x11Hotkeys) Bind(start, stop string) (string, error) {
-	startCode, err := h.keycode(start)
+func (h *x11Hotkeys) Bind(start, stop Hotkey) (string, error) {
+	startKey, err := h.key(start)
 	if err != nil {
 		return "", err
 	}
-	stopCode, err := h.keycode(stop)
+	stopKey, err := h.key(stop)
 	if err != nil {
 		return "", err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, old := range []xproto.Keycode{h.start, h.stop} {
-		if old != 0 {
+	for _, old := range []x11Key{h.start, h.stop} {
+		if old.code != 0 {
 			_ = h.grab(old, false)
 		}
 	}
-	h.start, h.stop = 0, 0
-	if err := h.grab(startCode, true); err != nil {
-		return "", err
+	h.start, h.stop = x11Key{}, x11Key{}
+	if err := h.grab(startKey, true); err != nil {
+		return "", fmt.Errorf("%v: %w", start, err)
 	}
-	if stopCode != startCode {
-		if err := h.grab(stopCode, true); err != nil {
-			_ = h.grab(startCode, false)
-			return "", err
+	if stopKey != startKey {
+		if err := h.grab(stopKey, true); err != nil {
+			_ = h.grab(startKey, false)
+			return "", fmt.Errorf("%v: %w", stop, err)
 		}
 	}
-	h.start, h.stop = startCode, stopCode
-	return "start Ctrl+" + start + ", stop Ctrl+" + stop, nil
+	h.start, h.stop = startKey, stopKey
+	return describeHotkeys(start, stop), nil
 }
 
 func (h *x11Hotkeys) loop() {
@@ -153,13 +169,14 @@ func (h *x11Hotkeys) loop() {
 			return
 		}
 		press, ok := ev.(xproto.KeyPressEvent)
-		if !ok || press.State&^(xproto.ModMaskLock|xproto.ModMask2) != xproto.ModMaskControl {
+		if !ok {
 			continue
 		}
+		pressed := x11Key{code: press.Detail, mods: press.State &^ (xproto.ModMaskLock | xproto.ModMask2)}
 		h.mu.Lock()
 		start, stop := h.start, h.stop
 		h.mu.Unlock()
-		switch press.Detail {
+		switch pressed {
 		case start:
 			h.onStart()
 		case stop:
