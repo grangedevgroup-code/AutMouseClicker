@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -39,7 +40,14 @@ type portal struct {
 	sender  string
 	mu      sync.Mutex
 	waiting map[dbus.ObjectPath]chan *dbus.Signal
-	signals map[string]func(*dbus.Signal)
+	nextID  int
+	signals map[int]signalHandler
+}
+
+type signalHandler struct {
+	name  string
+	match []dbus.MatchOption
+	fn    func(*dbus.Signal)
 }
 
 var (
@@ -67,7 +75,7 @@ func openPortal() (*portal, error) {
 		obj:     conn.Object(portalName, portalPath),
 		sender:  strings.ReplaceAll(strings.TrimPrefix(names[0], ":"), ".", "_"),
 		waiting: map[dbus.ObjectPath]chan *dbus.Signal{},
-		signals: map[string]func(*dbus.Signal){},
+		signals: map[int]signalHandler{},
 	}
 	p.obj.Call("org.freedesktop.host.portal.Registry.Register", 0, appID, map[string]dbus.Variant{})
 	ch := make(chan *dbus.Signal, 32)
@@ -80,23 +88,46 @@ func (p *portal) dispatch(ch chan *dbus.Signal) {
 	for s := range ch {
 		p.mu.Lock()
 		waiter := p.waiting[s.Path]
-		handler := p.signals[s.Name]
+		var handlers []func(*dbus.Signal)
+		for _, h := range p.signals {
+			if h.name == s.Name {
+				handlers = append(handlers, h.fn)
+			}
+		}
 		p.mu.Unlock()
 		if s.Name == requestIface+".Response" && waiter != nil {
 			waiter <- s
 			continue
 		}
-		if handler != nil {
-			handler(s)
+		for _, h := range handlers {
+			h(s)
 		}
 	}
 }
 
-func (p *portal) onSignal(iface, member string, handler func(*dbus.Signal)) error {
+func (p *portal) onSignal(iface, member string, path dbus.ObjectPath, fn func(*dbus.Signal)) (int, error) {
+	match := []dbus.MatchOption{dbus.WithMatchInterface(iface), dbus.WithMatchMember(member)}
+	if path != "" {
+		match = append(match, dbus.WithMatchObjectPath(path))
+	}
+	if err := p.conn.AddMatchSignal(match...); err != nil {
+		return 0, err
+	}
 	p.mu.Lock()
-	p.signals[iface+"."+member] = handler
+	defer p.mu.Unlock()
+	p.nextID++
+	p.signals[p.nextID] = signalHandler{name: iface + "." + member, match: match, fn: fn}
+	return p.nextID, nil
+}
+
+func (p *portal) offSignal(id int) {
+	p.mu.Lock()
+	h, ok := p.signals[id]
+	delete(p.signals, id)
 	p.mu.Unlock()
-	return p.conn.AddMatchSignal(dbus.WithMatchInterface(iface), dbus.WithMatchMember(member))
+	if ok {
+		_ = p.conn.RemoveMatchSignal(h.match...)
+	}
 }
 
 func token() string {
@@ -178,9 +209,13 @@ func restoreTokenPath() string {
 	return filepath.Join(dir, "autmouseclicker", "remote-desktop-token")
 }
 
+var errRemoteEnded = errors.New("the desktop ended control of the pointer; press Start to allow it again")
+
 type portalInjector struct {
 	p       *portal
 	session dbus.ObjectPath
+	watch   int
+	closed  atomic.Bool
 }
 
 func newPortalInjector() (Injector, error) {
@@ -223,7 +258,13 @@ func newPortalInjector() (Injector, error) {
 			_ = os.WriteFile(tokenFile, []byte(v), 0o600)
 		}
 	}
-	return &portalInjector{p: p, session: session}, nil
+	inj := &portalInjector{p: p, session: session}
+	inj.watch, err = p.onSignal(sessionIface, "Closed", session, func(*dbus.Signal) { inj.closed.Store(true) })
+	if err != nil {
+		p.closeSession(session)
+		return nil, fmt.Errorf("watching the remote desktop session: %w", err)
+	}
+	return inj, nil
 }
 
 func evdevButton(b Button) int32 {
@@ -237,6 +278,9 @@ func evdevButton(b Button) int32 {
 }
 
 func (i *portalInjector) button(b Button, state uint32) error {
+	if i.closed.Load() {
+		return errRemoteEnded
+	}
 	return i.p.obj.Call(remoteIface+".NotifyPointerButton", 0, i.session, map[string]dbus.Variant{}, evdevButton(b), state).Err
 }
 
@@ -244,13 +288,17 @@ func (i *portalInjector) Press(b Button) error   { return i.button(b, 1) }
 func (i *portalInjector) Release(b Button) error { return i.button(b, 0) }
 
 func (i *portalInjector) Close() error {
-	i.p.closeSession(i.session)
+	i.p.offSignal(i.watch)
+	if !i.closed.Load() {
+		i.p.closeSession(i.session)
+	}
 	return nil
 }
 
 type portalHotkeys struct {
 	p       *portal
 	session dbus.ObjectPath
+	watch   int
 }
 
 type shortcut struct {
@@ -268,7 +316,7 @@ func newPortalHotkeys(onStart, onStop func()) (Hotkeys, error) {
 		return nil, fmt.Errorf("global shortcuts session: %w", err)
 	}
 	h := &portalHotkeys{p: p, session: session}
-	err = p.onSignal(shortcutsIface, "Activated", func(s *dbus.Signal) {
+	h.watch, err = p.onSignal(shortcutsIface, "Activated", "", func(s *dbus.Signal) {
 		if len(s.Body) < 2 {
 			return
 		}
@@ -289,16 +337,16 @@ func newPortalHotkeys(onStart, onStop func()) (Hotkeys, error) {
 	return h, nil
 }
 
-func (h *portalHotkeys) Bind(start, stop string) (string, error) {
-	list := []shortcut{
-		{ID: "start", Options: map[string]dbus.Variant{
-			"description":       dbus.MakeVariant("Start clicking"),
-			"preferred_trigger": dbus.MakeVariant("CTRL+" + start),
-		}},
-		{ID: "stop", Options: map[string]dbus.Variant{
+func (h *portalHotkeys) Bind(start, stop Hotkey) (string, error) {
+	list := []shortcut{{ID: "start", Options: map[string]dbus.Variant{
+		"description":       dbus.MakeVariant("Start clicking"),
+		"preferred_trigger": dbus.MakeVariant(start.portalTrigger()),
+	}}}
+	if stop != start {
+		list = append(list, shortcut{ID: "stop", Options: map[string]dbus.Variant{
 			"description":       dbus.MakeVariant("Stop clicking"),
-			"preferred_trigger": dbus.MakeVariant("CTRL+" + stop),
-		}},
+			"preferred_trigger": dbus.MakeVariant(stop.portalTrigger()),
+		}})
 	}
 	res, err := h.p.request(shortcutsIface+".BindShortcuts", dialogTimeout, func(handle string) []any {
 		return []any{h.session, list, "", map[string]dbus.Variant{"handle_token": dbus.MakeVariant(handle)}}
@@ -306,10 +354,10 @@ func (h *portalHotkeys) Bind(start, stop string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return describeBound(res["shortcuts"].Value(), start, stop), nil
+	return describeBound(res["shortcuts"].Value(), start == stop)
 }
 
-func describeBound(value any, start, stop string) string {
+func describeBound(value any, toggle bool) (string, error) {
 	triggers := map[string]string{}
 	if list, ok := value.([][]any); ok {
 		for _, item := range list {
@@ -323,16 +371,17 @@ func describeBound(value any, start, stop string) string {
 			}
 		}
 	}
-	if triggers["start"] == "" {
-		triggers["start"] = "Ctrl+" + start
+	if triggers["start"] == "" || (!toggle && triggers["stop"] == "") {
+		return "", errors.New("the desktop did not assign the keys; set them in its keyboard shortcut settings")
 	}
-	if triggers["stop"] == "" {
-		triggers["stop"] = "Ctrl+" + stop
+	if toggle {
+		return triggers["start"] + " starts and stops clicking", nil
 	}
-	return "start " + triggers["start"] + ", stop " + triggers["stop"]
+	return triggers["start"] + " starts, " + triggers["stop"] + " stops", nil
 }
 
 func (h *portalHotkeys) Close() error {
+	h.p.offSignal(h.watch)
 	h.p.closeSession(h.session)
 	return nil
 }
