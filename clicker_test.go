@@ -50,19 +50,58 @@ func (f *fakeInjector) snapshot() ([]string, map[Button]bool) {
 
 func TestIntervalAddsTheFieldsAndNeverGoesBelowTheMinimum(t *testing.T) {
 	cases := []struct {
-		h, m, s, tenths, hundredths int
-		want                        time.Duration
+		h, m, s, ms int
+		want        time.Duration
 	}{
-		{0, 0, 5, 0, 0, 5 * time.Second},
-		{1, 2, 3, 4, 5, time.Hour + 2*time.Minute + 3*time.Second + 450*time.Millisecond},
-		{0, 0, 0, 0, 0, MinInterval},
-		{0, 0, 0, 0, 1, MinInterval},
-		{0, 0, 0, 1, 0, 100 * time.Millisecond},
+		{0, 0, 5, 0, 5 * time.Second},
+		{1, 2, 3, 450, time.Hour + 2*time.Minute + 3*time.Second + 450*time.Millisecond},
+		{0, 0, 0, 0, MinInterval},
+		{0, 0, 0, 5, MinInterval},
+		{0, 0, 0, 100, 100 * time.Millisecond},
 	}
 	for _, c := range cases {
-		if got := Interval(c.h, c.m, c.s, c.tenths, c.hundredths); got != c.want {
-			t.Errorf("Interval(%d,%d,%d,%d,%d) = %v, want %v", c.h, c.m, c.s, c.tenths, c.hundredths, got, c.want)
+		if got := Interval(c.h, c.m, c.s, c.ms); got != c.want {
+			t.Errorf("Interval(%d,%d,%d,%d) = %v, want %v", c.h, c.m, c.s, c.ms, got, c.want)
 		}
+	}
+}
+
+func TestAFailedInjectorIsReplacedOnTheNextStart(t *testing.T) {
+	var opened []*fakeInjector
+	c := NewClicker(func() (Injector, error) {
+		f := &fakeInjector{}
+		if len(opened) == 0 {
+			f.failAt = 1
+		}
+		opened = append(opened, f)
+		return f, nil
+	})
+	stopped := make(chan error, 1)
+	c.OnStop = func(err error) { stopped <- err }
+	if err := c.Start(Settings{Interval: 10 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-stopped:
+		if err == nil {
+			t.Fatal("the injector error was not reported")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("never stopped after the injector failed")
+	}
+	if !opened[0].closed {
+		t.Fatal("the failed injector was not closed")
+	}
+	if err := c.Start(Settings{Interval: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	deadline := time.Now().Add(time.Second)
+	for c.Clicks() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(opened) != 2 || c.Clicks() != 1 {
+		t.Fatalf("opened %d injectors, %d clicks; want a fresh injector that clicks", len(opened), c.Clicks())
 	}
 }
 
