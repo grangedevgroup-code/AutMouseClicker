@@ -3,14 +3,17 @@ package main
 import (
 	_ "embed"
 	"fmt"
-	"strconv"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -19,141 +22,189 @@ import (
 //go:embed assets/icon.svg
 var iconSVG []byte
 
+//go:embed assets/icon-active.svg
+var iconActiveSVG []byte
+
 var (
-	fieldKeys     = [5]string{"hours", "minutes", "seconds", "tenths", "hundredths"}
-	fieldLabels   = [5]string{"Hours", "Minutes", "Seconds", "1/10 s", "1/100 s"}
-	fieldDefaults = [5]int{0, 0, 1, 0, 0}
-	actions       = []string{"Single click", "Double click"}
+	actions        = []string{"Single click", "Double click"}
+	defaultStart   = Hotkey{Key: 6}
+	defaultStop    = Hotkey{Key: 7}
+	defaultSeconds = 1
 )
 
 type window struct {
-	app          fyne.App
-	win          fyne.Window
-	clicker      *Clicker
-	fields       [5]*widget.Entry
-	button       *widget.Select
-	action       *widget.Select
-	startKey     *widget.Select
-	stopKey      *widget.Select
-	status       *widget.Label
-	hotkeyStatus *widget.Label
-	startButton  *widget.Button
-	stopButton   *widget.Button
-	running      Settings
-	starting     bool
-	rebind       chan [2]string
-	hotkeysMu    sync.Mutex
-	hotkeys      Hotkeys
+	app        fyne.App
+	win        fyne.Window
+	clicker    *Clicker
+	icon       fyne.Resource
+	activeIcon fyne.Resource
+
+	hours, minutes, seconds, millis *spinner
+	button, action                  *widget.Select
+	startMod, startKey              *widget.Select
+	stopMod, stopKey                *widget.Select
+	hotkeyStatus                    *widget.Label
+	status                          *widget.Label
+	startButton, stopButton         *widget.Button
+	trayMenu                        *fyne.Menu
+	trayStart, trayStop             *fyne.MenuItem
+
+	running  Settings
+	starting bool
+	rebind   chan [2]Hotkey
+
+	hotkeysMu sync.Mutex
+	hotkeys   Hotkeys
+	cleanOnce sync.Once
 }
 
-func runGUI() {
+func runGUI(inst *instance) {
 	a := app.NewWithID(appID)
-	a.SetIcon(fyne.NewStaticResource("autmouseclicker.svg", iconSVG))
+	a.Settings().SetTheme(newCompactTheme())
+	icon := fyne.NewStaticResource("autmouseclicker.svg", iconSVG)
+	a.SetIcon(icon)
 	w := &window{
-		app:     a,
-		win:     a.NewWindow("AutMouseClicker"),
-		clicker: NewClicker(newInjector),
-		rebind:  make(chan [2]string, 1),
+		app:        a,
+		win:        a.NewWindow("AutMouseClicker"),
+		clicker:    NewClicker(newInjector),
+		icon:       icon,
+		activeIcon: fyne.NewStaticResource("autmouseclicker-active.svg", iconActiveSVG),
+		rebind:     make(chan [2]Hotkey, 1),
 	}
 	w.clicker.OnStop = func(err error) { fyne.Do(func() { w.stopped(err) }) }
 	w.build()
+	w.setupTray()
 	w.win.SetCloseIntercept(w.exit)
+	w.win.SetFixedSize(true)
+	a.Lifecycle().SetOnStopped(w.cleanup)
+	inst.OnActivate(func() { fyne.Do(w.show) })
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals
+		fyne.Do(a.Quit)
+	}()
 	go w.hotkeyWorker()
 	w.requestBind()
 	go w.refresh()
 	w.win.ShowAndRun()
 }
 
-func digitsOnly(e *widget.Entry) func(string) {
-	return func(text string) {
-		clean := strings.Map(func(r rune) rune {
-			if r >= '0' && r <= '9' {
-				return r
-			}
-			return -1
-		}, text)
-		if len(clean) > 3 {
-			clean = clean[:3]
-		}
-		if clean != text {
-			e.SetText(clean)
-		}
+func unitLabel(text string) *widget.Label {
+	return widget.NewLabel(text)
+}
+
+func fieldLabel(text string) *widget.Label {
+	l := widget.NewLabel(text)
+	l.Alignment = fyne.TextAlignTrailing
+	return l
+}
+
+func hotkeySelects(selected Hotkey, changed func()) (*widget.Select, *widget.Select) {
+	mod := widget.NewSelect(modifierNames, nil)
+	mod.SetSelected(selected.Mod.String())
+	key := widget.NewSelect(FunctionKeys(), nil)
+	key.SetSelected(selected.KeyName())
+	mod.OnChanged = func(string) { changed() }
+	key.OnChanged = func(string) { changed() }
+	return mod, key
+}
+
+func hotkeyFrom(mod, key *widget.Select) Hotkey {
+	m, _ := ParseModifier(mod.Selected)
+	return Hotkey{Mod: m, Key: functionKeyNumber(key.Selected)}
+}
+
+func savedHotkey(prefs fyne.Preferences, name string, fallback Hotkey) Hotkey {
+	if h, err := ParseHotkey(prefs.String(name)); err == nil {
+		return h
 	}
+	return fallback
 }
 
 func (w *window) build() {
 	prefs := w.app.Preferences()
-	columns := make([]fyne.CanvasObject, len(w.fields))
-	for i := range w.fields {
-		e := widget.NewEntry()
-		e.SetText(strconv.Itoa(prefs.IntWithFallback(fieldKeys[i], fieldDefaults[i])))
-		e.OnChanged = digitsOnly(e)
-		w.fields[i] = e
-		columns[i] = container.NewVBox(widget.NewLabel(fieldLabels[i]), e)
+	millis := prefs.IntWithFallback("millis", -1)
+	if millis < 0 {
+		millis = prefs.IntWithFallback("tenths", 0)*100 + prefs.IntWithFallback("hundredths", 0)*10
 	}
-	interval := widget.NewCard("Click interval", "", container.NewGridWithColumns(len(columns), columns...))
-
-	where := widget.NewRadioGroup([]string{"Where the mouse pointer is"}, nil)
-	where.SetSelected("Where the mouse pointer is")
-	where.Required = true
-	point := widget.NewCard("Click point", "", where)
+	w.hours = newSpinner(0, 99, 1, prefs.IntWithFallback("hours", 0))
+	w.minutes = newSpinner(0, 59, 1, prefs.IntWithFallback("minutes", 0))
+	w.seconds = newSpinner(0, 59, 1, prefs.IntWithFallback("seconds", defaultSeconds))
+	w.millis = newSpinner(0, 999, 10, millis)
+	interval := container.NewHBox(
+		w.hours, unitLabel("h"), w.minutes, unitLabel("min"), w.seconds, unitLabel("s"), w.millis, unitLabel("ms"))
 
 	w.button = widget.NewSelect(buttonNames, nil)
 	w.button.SetSelected(prefs.StringWithFallback("button", buttonNames[0]))
 	w.action = widget.NewSelect(actions, nil)
 	w.action.SetSelected(prefs.StringWithFallback("action", actions[0]))
-	options := widget.NewCard("Click options", "", container.New(layout.NewFormLayout(),
-		widget.NewLabel("Mouse button"), w.button,
-		widget.NewLabel("Mouse action"), w.action))
 
-	w.startKey = widget.NewSelect(FunctionKeys(), nil)
-	w.startKey.SetSelected(prefs.StringWithFallback("startKey", "F2"))
-	w.stopKey = widget.NewSelect(FunctionKeys(), nil)
-	w.stopKey.SetSelected(prefs.StringWithFallback("stopKey", "F3"))
-	w.startKey.OnChanged = func(string) { w.keysChanged() }
-	w.stopKey.OnChanged = func(string) { w.keysChanged() }
+	w.startMod, w.startKey = hotkeySelects(savedHotkey(prefs, "startHotkey", defaultStart), w.keysChanged)
+	w.stopMod, w.stopKey = hotkeySelects(savedHotkey(prefs, "stopHotkey", defaultStop), w.keysChanged)
 	w.hotkeyStatus = widget.NewLabel("Setting up hotkeys…")
+	w.hotkeyStatus.SizeName = theme.SizeNameCaptionText
 	w.hotkeyStatus.Wrapping = fyne.TextWrapWord
-	hotkeys := widget.NewCard("Hotkeys", "", container.NewVBox(
-		container.New(layout.NewFormLayout(),
-			widget.NewLabel("Start"), container.NewHBox(widget.NewLabel("Ctrl +"), w.startKey),
-			widget.NewLabel("Stop"), container.NewHBox(widget.NewLabel("Ctrl +"), w.stopKey)),
-		w.hotkeyStatus))
 
-	w.status = widget.NewLabel("Stopped. Input: " + backendName())
-	w.status.Wrapping = fyne.TextWrapWord
+	form := container.New(layout.NewFormLayout(),
+		fieldLabel("Click every"), interval,
+		fieldLabel("Mouse"), container.NewHBox(w.button, w.action),
+		fieldLabel("Start key"), container.NewHBox(w.startMod, w.startKey),
+		fieldLabel("Stop key"), container.NewHBox(w.stopMod, w.stopKey),
+	)
+
+	w.status = widget.NewLabel("Stopped. Clicks go where the pointer is.")
+	w.status.Truncation = fyne.TextTruncateEllipsis
 	w.startButton = widget.NewButtonWithIcon("Start", theme.MediaPlayIcon(), w.start)
 	w.startButton.Importance = widget.HighImportance
 	w.stopButton = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), w.stop)
 	w.stopButton.Disable()
-	exit := widget.NewButtonWithIcon("Exit", theme.LogoutIcon(), w.exit)
+	footer := container.NewBorder(nil, nil, nil, container.NewHBox(w.startButton, w.stopButton), w.status)
 
-	w.win.SetContent(container.NewPadded(container.NewVBox(
-		container.NewBorder(nil, nil, point, nil, interval),
-		container.NewGridWithColumns(2, hotkeys, options),
-		container.NewBorder(nil, nil, nil, container.NewHBox(w.startButton, w.stopButton, exit), w.status),
-	)))
+	w.win.SetContent(container.NewPadded(container.NewVBox(form, w.hotkeyStatus, widget.NewSeparator(), footer)))
+}
+
+func (w *window) setupTray() {
+	desk, ok := w.app.(desktop.App)
+	if !ok {
+		return
+	}
+	w.trayStart = fyne.NewMenuItem("Start clicking", w.start)
+	w.trayStop = fyne.NewMenuItem("Stop clicking", w.stop)
+	w.trayMenu = fyne.NewMenu("AutMouseClicker", w.trayStart, w.trayStop, fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("Show window", w.show))
+	desk.SetSystemTrayMenu(w.trayMenu)
+	desk.SetSystemTrayWindow(w.win)
+	w.updateTray(false)
+}
+
+func (w *window) updateTray(active bool) {
+	desk, ok := w.app.(desktop.App)
+	if !ok || w.trayMenu == nil {
+		return
+	}
+	w.trayStart.Disabled = active || w.starting
+	w.trayStop.Disabled = !active
+	w.trayMenu.Refresh()
+	if active {
+		desk.SetSystemTrayIcon(w.activeIcon)
+	} else {
+		desk.SetSystemTrayIcon(w.icon)
+	}
+}
+
+func (w *window) show() {
+	w.win.Show()
+	w.win.RequestFocus()
 }
 
 func (w *window) settings() (Settings, error) {
-	var v [5]int
-	for i, e := range w.fields {
-		text := strings.TrimSpace(e.Text)
-		if text == "" {
-			continue
-		}
-		n, err := strconv.Atoi(text)
-		if err != nil || n < 0 || n > 999 {
-			return Settings{}, fmt.Errorf("%s must be a whole number from 0 to 999", fieldLabels[i])
-		}
-		v[i] = n
-	}
 	button, err := ParseButton(w.button.Selected)
 	if err != nil {
 		return Settings{}, err
 	}
 	return Settings{
-		Interval: Interval(v[0], v[1], v[2], v[3], v[4]),
+		Interval: Interval(w.hours.Value(), w.minutes.Value(), w.seconds.Value(), w.millis.Value()),
 		Button:   button,
 		Double:   w.action.Selected == actions[1],
 	}, nil
@@ -161,14 +212,17 @@ func (w *window) settings() (Settings, error) {
 
 func (w *window) save() {
 	prefs := w.app.Preferences()
-	for i, e := range w.fields {
-		n, _ := strconv.Atoi(strings.TrimSpace(e.Text))
-		prefs.SetInt(fieldKeys[i], n)
-	}
+	prefs.SetInt("hours", w.hours.Value())
+	prefs.SetInt("minutes", w.minutes.Value())
+	prefs.SetInt("seconds", w.seconds.Value())
+	prefs.SetInt("millis", w.millis.Value())
 	prefs.SetString("button", w.button.Selected)
 	prefs.SetString("action", w.action.Selected)
-	prefs.SetString("startKey", w.startKey.Selected)
-	prefs.SetString("stopKey", w.stopKey.Selected)
+	prefs.SetString("startHotkey", hotkeyFrom(w.startMod, w.startKey).String())
+	prefs.SetString("stopHotkey", hotkeyFrom(w.stopMod, w.stopKey).String())
+	for _, old := range []string{"tenths", "hundredths", "startKey", "stopKey"} {
+		prefs.RemoveValue(old)
+	}
 }
 
 func describe(s Settings, clicks int64) string {
@@ -176,7 +230,7 @@ func describe(s Settings, clicks int64) string {
 	if s.Double {
 		kind = "Double-clicking"
 	}
-	return fmt.Sprintf("%s the %s button every %v: %d clicks", kind, strings.ToLower(s.Button.String()), s.Interval, clicks)
+	return fmt.Sprintf("%s %s every %v: %d clicks", kind, strings.ToLower(s.Button.String()), s.Interval, clicks)
 }
 
 func (w *window) start() {
@@ -191,18 +245,21 @@ func (w *window) start() {
 	w.save()
 	w.starting = true
 	w.startButton.Disable()
-	w.status.SetText("Starting… the desktop may ask you to allow AutMouseClicker to control the pointer.")
+	w.updateTray(false)
+	w.status.SetText("Starting… the desktop may ask to let AutMouseClicker control the pointer.")
 	go func() {
 		err := w.clicker.Start(s)
 		fyne.Do(func() {
 			w.starting = false
 			if err != nil {
 				w.startButton.Enable()
+				w.updateTray(false)
 				w.status.SetText("Could not start: " + err.Error())
 				return
 			}
 			w.running = s
 			w.stopButton.Enable()
+			w.updateTray(true)
 			w.status.SetText(describe(s, w.clicker.Clicks()))
 		})
 	}()
@@ -216,11 +273,28 @@ func (w *window) stop() {
 	w.stopped(nil)
 }
 
+func (w *window) toggle() {
+	if w.clicker.Running() {
+		w.stop()
+		return
+	}
+	w.start()
+}
+
+func (w *window) hotkeyStart() {
+	if hotkeyFrom(w.startMod, w.startKey) == hotkeyFrom(w.stopMod, w.stopKey) {
+		w.toggle()
+		return
+	}
+	w.start()
+}
+
 func (w *window) stopped(err error) {
 	w.stopButton.Disable()
 	if !w.starting {
 		w.startButton.Enable()
 	}
+	w.updateTray(false)
 	if err != nil {
 		w.status.SetText("Stopped: " + err.Error())
 		return
@@ -245,16 +319,12 @@ func (w *window) refresh() {
 }
 
 func (w *window) keysChanged() {
-	if w.startKey.Selected == w.stopKey.Selected {
-		w.hotkeyStatus.SetText("Choose two different keys for start and stop.")
-		return
-	}
 	w.save()
 	w.requestBind()
 }
 
 func (w *window) requestBind() {
-	keys := [2]string{w.startKey.Selected, w.stopKey.Selected}
+	keys := [2]Hotkey{hotkeyFrom(w.startMod, w.startKey), hotkeyFrom(w.stopMod, w.stopKey)}
 	select {
 	case <-w.rebind:
 	default:
@@ -268,7 +338,7 @@ func (w *window) hotkeyWorker() {
 		h := w.hotkeys
 		w.hotkeysMu.Unlock()
 		if h == nil {
-			created, err := newHotkeys(func() { fyne.Do(w.start) }, func() { fyne.Do(w.stop) })
+			created, err := newHotkeys(func() { fyne.Do(w.hotkeyStart) }, func() { fyne.Do(w.stop) })
 			if err != nil {
 				fyne.Do(func() { w.hotkeyStatus.SetText("Hotkeys unavailable: " + err.Error()) })
 				continue
@@ -281,24 +351,28 @@ func (w *window) hotkeyWorker() {
 		bound, err := h.Bind(keys[0], keys[1])
 		fyne.Do(func() {
 			if err != nil {
-				w.hotkeyStatus.SetText("Hotkeys unavailable: " + err.Error())
+				w.hotkeyStatus.SetText("Hotkeys not set: " + err.Error())
 				return
 			}
-			w.hotkeyStatus.SetText("Hotkeys: " + bound)
+			w.hotkeyStatus.SetText("Hotkeys work in any window: " + bound + ".")
 		})
 	}
 }
 
 func (w *window) exit() {
 	w.win.Hide()
-	go func() {
+	w.app.Quit()
+}
+
+func (w *window) cleanup() {
+	w.cleanOnce.Do(func() {
 		_ = w.clicker.Close()
 		w.hotkeysMu.Lock()
 		h := w.hotkeys
+		w.hotkeys = nil
 		w.hotkeysMu.Unlock()
 		if h != nil {
 			_ = h.Close()
 		}
-		fyne.Do(w.app.Quit)
-	}()
+	})
 }
