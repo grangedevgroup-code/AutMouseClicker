@@ -16,3 +16,5 @@ func newInjector() (Injector, error) {
 func newHotkeys(onStart, onStop func()) (Hotkeys, error) {
 	return nil, fmt.Errorf("global hotkeys on %s are not supported yet", runtime.GOOS)
 }
+
+func forgetKDEHotkeys() {}
