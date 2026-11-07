@@ -178,3 +178,24 @@ func TestOpenErrorsAreReturnedAndTheClickerCanBeRetried(t *testing.T) {
 		t.Fatalf("Close = %v, injector closed %v", err, f.closed)
 	}
 }
+
+func TestRoundsStopTheClickerByItselfAndReportNoError(t *testing.T) {
+	f := &fakeInjector{}
+	finished := make(chan error, 1)
+	c := NewClicker(func() (Injector, error) { return f, nil })
+	c.OnStop = func(err error) { finished <- err }
+	if err := c.Start(Settings{Interval: 10 * time.Millisecond, Double: true, Rounds: 3}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("finished with %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("never finished")
+	}
+	if c.Running() || c.Clicks() != 6 {
+		t.Fatalf("running %v, %d clicks; want stopped after 6", c.Running(), c.Clicks())
+	}
+}
