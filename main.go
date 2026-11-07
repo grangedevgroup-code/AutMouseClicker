@@ -18,6 +18,8 @@ const usageText = `AutMouseClicker %s: clicks the mouse for you, where the point
 Usage:
   autmouseclicker                 open the window
   autmouseclicker click [flags]   click from the command line until Ctrl+C
+  autmouseclicker install         add the app to the menu and the desktop
+  autmouseclicker uninstall       remove it from the menu and the desktop
   autmouseclicker version         print the version
 
 Flags for click:
@@ -38,12 +40,21 @@ func main() {
 			return
 		case "click":
 			os.Exit(runClick(os.Args[2:]))
+		case "install":
+			os.Exit(runInstall())
+		case "uninstall":
+			os.Exit(runUninstall())
 		default:
 			fmt.Fprintf(os.Stderr, usageText, version)
 			os.Exit(2)
 		}
 	}
-	runGUI()
+	inst, primary := claimInstance()
+	if !primary {
+		return
+	}
+	defer inst.Close()
+	runGUI(inst)
 }
 
 func runClick(args []string) int {
